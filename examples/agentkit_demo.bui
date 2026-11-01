@@ -1,0 +1,10 @@
+Import agentkit
+
+Sub Main()
+    Dim initialize As JSONItem = CodexInitialize(JSONItem.From(1.0))
+    Print EncodeJSONLine(initialize).ToString(Text.Encodings.UTF8)
+    Dim tools As JSONItem = MCPToolsList(JSONItem.From("discover-project-tools"))
+    Print EncodeJSONLine(tools).ToString(Text.Encodings.UTF8)
+    Dim normalized As AgentEvent = NormalizeEvent(AgentProtocol.ACP, Json.Parse("{\"method\":\"session/update\",\"params\":{\"sessionId\":\"demo\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Ready to inspect project items\"}}}}"))
+    Print normalized.Kind + ": " + normalized.Text
+End Sub

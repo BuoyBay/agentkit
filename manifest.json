@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "name": "agentkit",
+  "version": "0.1.0",
+  "description": "JSONL agent protocol codecs, ACP/Codex/Claude event adapters and MCP request builders for developer tools"
+}

@@ -1,0 +1,767 @@
+' Protocol codecs only: callers own subprocess/network transport and execution policy.
+Public Enum AgentProtocol As Integer
+    ACP = 1
+    Codex = 2
+    Claude = 3
+    MCP = 4
+    Custom = 5
+End Enum
+
+Private Sub InvalidAgent(message As String)
+    Throw New InvalidArgumentException("AgentKit: " + message)
+End Sub
+
+Private Function CloneJSON(item As JSONItem) As JSONItem
+    If item = Nil Then Return JSONItem.Null()
+    Dim serialized As String = Json.Stringify(item)
+    Dim encoded As Bytes = Bytes.FromString(serialized, Text.Encodings.UTF8)
+    ValidateJSONBytes(encoded)
+    Return Json.Parse(serialized)
+End Function
+
+Private Sub RequireObject(item As JSONItem)
+    If item = Nil Then InvalidAgent("JSON object is required")
+    If Not item.IsObject() Then InvalidAgent("JSON object is required")
+End Sub
+
+Private Sub RequireText(value As String, label As String)
+    If value = "" Then InvalidAgent(label + " is required")
+End Sub
+
+Private Function IsId(item As JSONItem) As Boolean
+    If item = Nil Then Return False
+    If item.IsString() Then Return True
+    If Not item.IsNumber() Then Return False
+    Dim number As Double = item.AsNumber().Value
+    Return number >= -9007199254740991.0 And number <= 9007199254740991.0 And number = Math.Floor(number)
+End Function
+
+Private Function TokenEquals(leftValue As String, rightValue As String) As Boolean
+    Return String.Compare(leftValue, rightValue, True) = 0
+End Function
+
+Private Function TokenIndex(value As String, choices As Array Of String) As Integer
+    For index As Integer = 0 To Array.Count(choices) - 1
+        If TokenEquals(value, choices(index)) Then Return index
+    Next
+    Return -1
+End Function
+
+Private Sub RequireProtocol(protocol As AgentProtocol)
+    If protocol <> AgentProtocol.ACP And protocol <> AgentProtocol.Codex And protocol <> AgentProtocol.Claude And protocol <> AgentProtocol.MCP And protocol <> AgentProtocol.Custom Then InvalidAgent("unknown protocol")
+End Sub
+
+''' An explicit local endpoint; it never discovers, launches or substitutes an agent.
+Public Class AgentEndpoint
+    Private Property mName As String
+    Private Property mProtocol As AgentProtocol
+    Private Property mExecutable As String
+    Private Property mArguments As Array Of String
+
+    Public Sub Constructor(name As String, protocol As AgentProtocol, executable As String, arguments As Array Of String)
+        RequireText(name, "endpoint name")
+        RequireProtocol(protocol)
+        RequireText(executable, "executable")
+        Me.mName = name
+        Me.mProtocol = protocol
+        Me.mExecutable = executable
+        Me.mArguments = Array.Clone(arguments)
+    End Sub
+
+    Public Property Name As String
+        Get
+            Return Me.mName
+        End Get
+    End Property
+    Public Property Protocol As AgentProtocol
+        Get
+            Return Me.mProtocol
+        End Get
+    End Property
+    Public Property Executable As String
+        Get
+            Return Me.mExecutable
+        End Get
+    End Property
+    Public Property Arguments As Array Of String
+        Get
+            Return Array.Clone(Me.mArguments)
+        End Get
+    End Property
+End Class
+
+''' Deliberately compact normalization; RawJSON preserves provider-specific fields.
+Public Class AgentEvent
+    Private Property mKind As String
+    Private Property mText As String
+    Private Property mSessionId As String
+    Private Property mTurnId As String
+    Private Property mToolCallId As String
+    Private Property mRequestId As JSONItem
+    Private Property mRaw As JSONItem
+
+    Internal Sub Constructor(kind As String, text As String, sessionId As String, turnId As String, toolCallId As String, requestId As JSONItem, raw As JSONItem)
+        Me.mKind = kind
+        Me.mText = text
+        Me.mSessionId = sessionId
+        Me.mTurnId = turnId
+        Me.mToolCallId = toolCallId
+        Me.mRequestId = CloneJSON(requestId)
+        Me.mRaw = CloneJSON(raw)
+    End Sub
+
+    Public Property Kind As String
+        Get
+            Return Me.mKind
+        End Get
+    End Property
+    Public Property Text As String
+        Get
+            Return Me.mText
+        End Get
+    End Property
+    Public Property SessionId As String
+        Get
+            Return Me.mSessionId
+        End Get
+    End Property
+    Public Property TurnId As String
+        Get
+            Return Me.mTurnId
+        End Get
+    End Property
+    Public Property ToolCallId As String
+        Get
+            Return Me.mToolCallId
+        End Get
+    End Property
+    Public Property RequestId As JSONItem
+        Get
+            Return CloneJSON(Me.mRequestId)
+        End Get
+    End Property
+    Public Property RawJSON As JSONItem
+        Get
+            Return CloneJSON(Me.mRaw)
+        End Get
+    End Property
+End Class
+
+''' Encode exactly one UTF-8 JSON object followed by LF. No Content-Length header.
+Public Function EncodeJSONLine(message As JSONItem, maxLineBytes As Integer = 8388608) As Bytes
+    RequireObject(message)
+    If maxLineBytes < 1 Or maxLineBytes > 2147483647 Then InvalidAgent("invalid line size limit")
+    Dim serialized As String = Json.Stringify(message)
+    Dim encoded As Bytes = Bytes.FromString(serialized, Text.Encodings.UTF8)
+    Dim checkedText As String = encoded.ToString(Text.Encodings.UTF8)
+    ValidateJSONBytes(encoded)
+    If encoded.Count > maxLineBytes Then InvalidAgent("JSON line exceeds limit")
+    encoded.Append(10)
+    Return encoded
+End Function
+
+Private Sub ValidateAgentNumber(token As String)
+    Dim data As Bytes = Bytes.FromString(token, Text.Encodings.UTF8)
+    Dim i As Integer = 0
+    Dim count As Integer = data.Count
+    If count > 0 Then
+        If data.Item(0) = 45 Then i = 1
+    End If
+    If i >= count Then Throw New InvalidArgumentException("Invalid agent JSON number")
+    Dim first As Integer = data.Item(i)
+    If first = 48 Then
+        i += 1
+    Else
+        If first < 49 Or first > 57 Then Throw New InvalidArgumentException("Invalid agent JSON number")
+        i += 1
+        While i < count
+            Dim scalar As Integer = data.Item(i)
+            If scalar < 48 Or scalar > 57 Then Exit While
+            i += 1
+        End While
+    End If
+    If i < count Then
+        If data.Item(i) = 46 Then
+            i += 1
+            Dim digits As Integer = 0
+            While i < count
+                Dim scalar As Integer = data.Item(i)
+                If scalar < 48 Or scalar > 57 Then Exit While
+                i += 1
+                digits += 1
+            End While
+            If digits = 0 Then Throw New InvalidArgumentException("Invalid agent JSON number")
+        End If
+    End If
+    If i < count Then
+        Dim exponentMarker As Integer = data.Item(i)
+        If exponentMarker = 101 Or exponentMarker = 69 Then
+            i += 1
+            If i < count Then
+                Dim sign As Integer = data.Item(i)
+                If sign = 43 Or sign = 45 Then i += 1
+            End If
+            Dim digits As Integer = 0
+            While i < count
+                Dim scalar As Integer = data.Item(i)
+                If scalar < 48 Or scalar > 57 Then Exit While
+                i += 1
+                digits += 1
+            End While
+            If digits = 0 Then Throw New InvalidArgumentException("Invalid agent JSON number")
+        End If
+    End If
+    If i <> count Then Throw New InvalidArgumentException("Invalid agent JSON number")
+    Dim parsedNumber As Result Of Double, String = Double.Parse(token)
+    If parsedNumber.IsErr Then Throw New InvalidArgumentException("Invalid agent JSON number")
+    Dim scalar As Double = parsedNumber.Value
+    If scalar <> scalar Or scalar = Double.Infinity Or scalar = -Double.Infinity Then Throw New InvalidArgumentException("Nonfinite agent JSON number")
+End Sub
+
+Private Sub ValidateJSONBytes(body As Bytes)
+    Dim quoted As Boolean = False
+    Dim escaped As Boolean = False
+    Dim depth As Integer = 0
+    Dim index As Integer = 0
+    While index < body.Count
+        Dim code As Integer = body.Item(index)
+        If quoted Then
+            If code < 32 Then InvalidAgent("unescaped control byte in JSON string")
+            If escaped Then
+                ' Buoy 0.72 drops decoded NUL; reject before it can alias identifiers.
+                If code = 117 And index + 4 < body.Count Then
+                    If body.Item(index + 1) = 48 And body.Item(index + 2) = 48 And body.Item(index + 3) = 48 And body.Item(index + 4) = 48 Then InvalidAgent("JSON NUL escape is unsupported by this Buoy runtime")
+                End If
+                escaped = False
+            ElseIf code = 92 Then
+                escaped = True
+            ElseIf code = 34 Then
+                quoted = False
+            End If
+        ElseIf code = 34 Then
+            quoted = True
+        ElseIf code = 123 Or code = 91 Then
+            depth += 1
+            If depth > 128 Then InvalidAgent("JSON nesting exceeds 128 levels")
+        ElseIf code = 125 Or code = 93 Then
+            depth -= 1
+        ElseIf code <> 32 And code <> 9 And code <> 10 And code <> 13 And code <> 44 And code <> 58 Then
+            ' The runtime parser accepts non-JSON forms such as 01 and aliases IDs.
+            Dim token As New Bytes()
+            While index < body.Count
+                Dim current As Integer = body.Item(index)
+                If current = 32 Or current = 9 Or current = 10 Or current = 13 Or current = 44 Or current = 58 Or current = 91 Or current = 93 Or current = 123 Or current = 125 Or current = 34 Then Exit While
+                token.Append(current)
+                index += 1
+            End While
+            Dim text As String = token.ToString(Text.Encodings.UTF8)
+            If Not TokenEquals(text, "true") And Not TokenEquals(text, "false") And Not TokenEquals(text, "null") Then ValidateAgentNumber(text)
+            index -= 1
+        End If
+        index += 1
+    End While
+End Sub
+
+Public Class JSONLDecoder
+    Private Property Pending As Bytes = New Bytes()
+    Private Property Failed As Boolean = False
+    Private Property LineLimit As Integer
+    Private Property FeedLimit As Integer
+    Private Property MessageLimit As Integer
+
+    Public Sub Constructor(maxLineBytes As Integer = 8388608, maxFeedBytes As Integer = 67108864, maxMessagesPerFeed As Integer = 256)
+        If maxLineBytes < 1 Or maxLineBytes > 2147483647 Or maxFeedBytes < 1 Or maxFeedBytes > 2147483647 Or maxMessagesPerFeed < 1 Or maxMessagesPerFeed > 65536 Then InvalidAgent("invalid decoder limits")
+        Me.LineLimit = maxLineBytes
+        Me.FeedLimit = maxFeedBytes
+        Me.MessageLimit = maxMessagesPerFeed
+    End Sub
+
+    Public Property IsFailed As Boolean
+        Get
+            Return Me.Failed
+        End Get
+    End Property
+    Public Property HasPendingData As Boolean
+        Get
+            Return Me.Pending.Count > 0
+        End Get
+    End Property
+
+    Public Sub Reset()
+        Me.Pending = New Bytes()
+        Me.Failed = False
+    End Sub
+
+    Public Function Feed(chunk As Bytes) As Array Of JSONItem
+        If Me.Failed Then InvalidAgent("decoder failed; reset before reuse")
+        Dim messages(0) As JSONItem
+        Try
+            If chunk = Nil Then InvalidAgent("chunk is required")
+            If chunk.Count > Me.FeedLimit Then InvalidAgent("feed exceeds limit")
+            For index As Integer = 0 To chunk.Count - 1
+                Dim code As Integer = chunk.Item(index)
+                If code = 10 Then
+                    If Array.Count(messages) >= Me.MessageLimit Then InvalidAgent("message count exceeds feed limit")
+                    Dim size As Integer = Me.Pending.Count
+                    If size > 0 Then
+                        If Me.Pending.Item(size - 1) = 13 Then size -= 1
+                    End If
+                    If size = 0 Then InvalidAgent("empty JSON line")
+                    Dim body As New Bytes()
+                    body.Append(Me.Pending.DataPtr(), size)
+                    ValidateJSONBytes(body)
+                    Dim content As String = body.ToString(Text.Encodings.UTF8)
+                    Dim message As JSONItem = Json.Parse(content)
+                    RequireObject(message)
+                    Array.Append(messages, message)
+                    Me.Pending = New Bytes()
+                Else
+                    If Me.Pending.Count >= Me.LineLimit Then InvalidAgent("JSON line exceeds limit")
+                    ' Raw LF is a delimiter; other controls except JSON whitespace reject.
+                    If code < 32 And code <> 9 And code <> 13 Then InvalidAgent("raw control byte in JSON line")
+                    Me.Pending.Append(code)
+                End If
+            Next
+            Return messages
+        Catch e As Exception
+            Me.Failed = True
+            Me.Pending = New Bytes()
+            Throw e
+        End Try
+    End Function
+
+    Public Sub Finish()
+        If Me.Failed Then InvalidAgent("decoder failed; reset before reuse")
+        If Me.Pending.Count <> 0 Then
+            Me.Failed = True
+            Me.Pending = New Bytes()
+            InvalidAgent("truncated JSON line at EOF")
+        End If
+    End Sub
+End Class
+
+''' Generic escape hatch for documented methods; Claude stream-json is not RPC.
+Public Function AgentRequest(protocol As AgentProtocol, requestId As JSONItem, methodName As String, arguments As JSONItem) As JSONItem
+    RequireProtocol(protocol)
+    If protocol = AgentProtocol.Claude Then InvalidAgent("Claude stream-json does not use JSON-RPC requests")
+    If Not IsId(requestId) Then InvalidAgent("request id must be a string or exact integer")
+    RequireText(methodName, "method")
+    If arguments <> Nil Then RequireObject(arguments)
+    Dim message As JSONItem = JSONItem.NewObject()
+    If protocol <> AgentProtocol.Codex Then message.Value("jsonrpc") = "2.0"
+    message.Value("id") = CloneJSON(requestId)
+    message.Value("method") = methodName
+    If arguments <> Nil Then message.Value("params") = CloneJSON(arguments)
+    Return message
+End Function
+
+Public Function AgentNotification(protocol As AgentProtocol, methodName As String, arguments As JSONItem) As JSONItem
+    RequireProtocol(protocol)
+    If protocol = AgentProtocol.Claude Then InvalidAgent("Claude stream-json does not use JSON-RPC notifications")
+    RequireText(methodName, "method")
+    If arguments <> Nil Then RequireObject(arguments)
+    Dim message As JSONItem = JSONItem.NewObject()
+    If protocol <> AgentProtocol.Codex Then message.Value("jsonrpc") = "2.0"
+    message.Value("method") = methodName
+    If arguments <> Nil Then message.Value("params") = CloneJSON(arguments)
+    Return message
+End Function
+
+Public Function AgentResponse(protocol As AgentProtocol, requestId As JSONItem, payload As JSONItem) As JSONItem
+    RequireProtocol(protocol)
+    If protocol = AgentProtocol.Claude Then InvalidAgent("Claude stream-json does not use JSON-RPC responses")
+    If Not IsId(requestId) Then InvalidAgent("response id must be a string or exact integer")
+    Dim message As JSONItem = JSONItem.NewObject()
+    If protocol <> AgentProtocol.Codex Then message.Value("jsonrpc") = "2.0"
+    message.Value("id") = CloneJSON(requestId)
+    message.Value("result") = CloneJSON(payload)
+    Return message
+End Function
+
+Private Function ClientInfo(name As String, version As String) As JSONItem
+    RequireText(name, "client name")
+    RequireText(version, "client version")
+    Dim info As JSONItem = JSONItem.NewObject()
+    info.Value("name") = name
+    info.Value("version") = version
+    Return info
+End Function
+
+Public Function ACPInitialize(requestId As JSONItem, clientName As String = "buoy-studio", version As String = "0.1.0") As JSONItem
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("protocolVersion") = 1.0
+    arguments.Value("clientCapabilities") = JSONItem.NewObject()
+    arguments.Value("clientInfo") = ClientInfo(clientName, version)
+    Return AgentRequest(AgentProtocol.ACP, requestId, "initialize", arguments)
+End Function
+
+Public Function ACPNewSession(requestId As JSONItem, workingDirectory As String, mcpServers As JSONItem) As JSONItem
+    RequireText(workingDirectory, "working directory")
+    If mcpServers <> Nil Then
+        If Not mcpServers.IsArray() Then InvalidAgent("mcpServers must be an array")
+    End If
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("cwd") = workingDirectory
+    If mcpServers = Nil Then
+        arguments.Value("mcpServers") = JSONItem.NewArray()
+    Else
+        arguments.Value("mcpServers") = CloneJSON(mcpServers)
+    End If
+    Return AgentRequest(AgentProtocol.ACP, requestId, "session/new", arguments)
+End Function
+
+Private Function TextContent(text As String) As JSONItem
+    Dim content As JSONItem = JSONItem.NewObject()
+    content.Value("type") = "text"
+    content.Value("text") = text
+    Return content
+End Function
+
+Public Function ACPPrompt(requestId As JSONItem, sessionId As String, text As String) As JSONItem
+    RequireText(sessionId, "session id")
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("sessionId") = sessionId
+    Dim content As JSONItem = JSONItem.NewArray()
+    content.Add(TextContent(text))
+    arguments.Value("prompt") = content
+    Return AgentRequest(AgentProtocol.ACP, requestId, "session/prompt", arguments)
+End Function
+
+Public Function ACPCancel(sessionId As String) As JSONItem
+    RequireText(sessionId, "session id")
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("sessionId") = sessionId
+    Return AgentNotification(AgentProtocol.ACP, "session/cancel", arguments)
+End Function
+
+''' Empty selectedOptionId means cancelled; caller must present offered options to the user.
+Public Function ACPPermission(requestId As JSONItem, selectedOptionId As String) As JSONItem
+    Dim outcome As JSONItem = JSONItem.NewObject()
+    If selectedOptionId = "" Then
+        outcome.Value("outcome") = "cancelled"
+    Else
+        outcome.Value("outcome") = "selected"
+        outcome.Value("optionId") = selectedOptionId
+    End If
+    Dim payload As JSONItem = JSONItem.NewObject()
+    payload.Value("outcome") = outcome
+    Return AgentResponse(AgentProtocol.ACP, requestId, payload)
+End Function
+
+Public Function CodexInitialize(requestId As JSONItem, clientName As String = "buoy-studio", version As String = "0.1.0") As JSONItem
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    Dim info As JSONItem = ClientInfo(clientName, version)
+    info.Value("title") = clientName
+    arguments.Value("clientInfo") = info
+    Return AgentRequest(AgentProtocol.Codex, requestId, "initialize", arguments)
+End Function
+
+Public Function CodexInitialized() As JSONItem
+    Return AgentNotification(AgentProtocol.Codex, "initialized", Nil)
+End Function
+
+Public Function CodexStartThread(requestId As JSONItem, workingDirectory As String) As JSONItem
+    RequireText(workingDirectory, "working directory")
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("cwd") = workingDirectory
+    Return AgentRequest(AgentProtocol.Codex, requestId, "thread/start", arguments)
+End Function
+
+Public Function CodexStartTurn(requestId As JSONItem, threadId As String, text As String) As JSONItem
+    RequireText(threadId, "thread id")
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("threadId") = threadId
+    Dim content As JSONItem = JSONItem.NewArray()
+    content.Add(TextContent(text))
+    arguments.Value("input") = content
+    Return AgentRequest(AgentProtocol.Codex, requestId, "turn/start", arguments)
+End Function
+
+Public Function CodexInterrupt(requestId As JSONItem, threadId As String, turnId As String) As JSONItem
+    RequireText(threadId, "thread id")
+    RequireText(turnId, "turn id")
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("threadId") = threadId
+    arguments.Value("turnId") = turnId
+    Return AgentRequest(AgentProtocol.Codex, requestId, "turn/interrupt", arguments)
+End Function
+
+''' For command/file-change approvals; permission-grant requests have a different result schema.
+Public Function CodexApproval(requestId As JSONItem, decision As String) As JSONItem
+    If TokenIndex(decision, ["accept", "acceptForSession", "decline", "cancel"]) < 0 Then InvalidAgent("invalid Codex approval decision")
+    Dim payload As JSONItem = JSONItem.NewObject()
+    payload.Value("decision") = decision
+    Return AgentResponse(AgentProtocol.Codex, requestId, payload)
+End Function
+
+Public Function ClaudeUserMessage(text As String, sessionId As String = "") As JSONItem
+    Dim content As JSONItem = JSONItem.NewObject()
+    content.Value("role") = "user"
+    content.Value("content") = text
+    Dim message As JSONItem = JSONItem.NewObject()
+    message.Value("type") = "user"
+    message.Value("message") = content
+    If sessionId <> "" Then message.Value("session_id") = sessionId
+    message.Value("parent_tool_use_id") = JSONItem.Null()
+    Return message
+End Function
+
+Public Function MCPInitialize(requestId As JSONItem, clientName As String = "buoy-studio", version As String = "0.1.0", protocolVersion As String = "2025-11-25") As JSONItem
+    RequireText(protocolVersion, "MCP protocol version")
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("protocolVersion") = protocolVersion
+    arguments.Value("capabilities") = JSONItem.NewObject()
+    arguments.Value("clientInfo") = ClientInfo(clientName, version)
+    Return AgentRequest(AgentProtocol.MCP, requestId, "initialize", arguments)
+End Function
+
+Public Function MCPInitialized() As JSONItem
+    Return AgentNotification(AgentProtocol.MCP, "notifications/initialized", Nil)
+End Function
+
+Public Function MCPToolsList(requestId As JSONItem, cursor As String = "") As JSONItem
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    If cursor <> "" Then arguments.Value("cursor") = cursor
+    Return AgentRequest(AgentProtocol.MCP, requestId, "tools/list", arguments)
+End Function
+
+Public Function MCPCallTool(requestId As JSONItem, toolName As String, toolArguments As JSONItem) As JSONItem
+    RequireText(toolName, "tool name")
+    RequireObject(toolArguments)
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("name") = toolName
+    arguments.Value("arguments") = CloneJSON(toolArguments)
+    Return AgentRequest(AgentProtocol.MCP, requestId, "tools/call", arguments)
+End Function
+
+Public Function MCPResourcesList(requestId As JSONItem, cursor As String = "") As JSONItem
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    If cursor <> "" Then arguments.Value("cursor") = cursor
+    Return AgentRequest(AgentProtocol.MCP, requestId, "resources/list", arguments)
+End Function
+
+Public Function MCPReadResource(requestId As JSONItem, uri As String) As JSONItem
+    RequireText(uri, "resource URI")
+    Dim arguments As JSONItem = JSONItem.NewObject()
+    arguments.Value("uri") = uri
+    Return AgentRequest(AgentProtocol.MCP, requestId, "resources/read", arguments)
+End Function
+
+Private Function TextField(item As JSONItem, key As String) As String
+    Return item.Value(key).AsString().Or("")
+End Function
+
+Private Function ContentText(content As JSONItem) As String
+    If content.IsString() Then Return content.AsString().Value
+    If content.IsObject() Then Return TextField(content, "text")
+    Dim collected As String = ""
+    If content.IsArray() Then
+        For index As Integer = 0 To content.Count() - 1
+            Dim part As JSONItem = content.ValueAt(index)
+            If TokenEquals(TextField(part, "type"), "text") Then collected += TextField(part, "text")
+        Next
+    End If
+    Return collected
+End Function
+
+''' Normalize a single event without executing any request or granting permissions.
+Public Function NormalizeEvent(protocol As AgentProtocol, message As JSONItem) As AgentEvent
+    RequireProtocol(protocol)
+    RequireObject(message)
+    Dim kind As String = "unknown"
+    Dim content As String = ""
+    Dim sessionId As String = ""
+    Dim turnId As String = ""
+    Dim toolCallId As String = ""
+    Dim requestId As JSONItem = message.Value("id")
+    Dim methodName As String = TextField(message, "method")
+    Dim arguments As JSONItem = message.Value("params")
+    If protocol = AgentProtocol.Claude Then
+        sessionId = TextField(message, "session_id")
+        Select Case TokenIndex(TextField(message, "type"), ["system", "stream_event", "assistant", "user", "result", "control_request"])
+            Case 0
+                kind = "session_status"
+                If TokenEquals(TextField(message, "subtype"), "init") Then kind = "session_started"
+            Case 1
+                Dim streamed As JSONItem = message.Value("event")
+                Select Case TokenIndex(TextField(streamed, "type"), ["content_block_delta", "content_block_start"])
+                    Case 0
+                        Dim delta As JSONItem = streamed.Value("delta")
+                        If TokenEquals(TextField(delta, "type"), "text_delta") Then
+                            kind = "text_delta"
+                            content = TextField(delta, "text")
+                        ElseIf TokenEquals(TextField(delta, "type"), "input_json_delta") Then
+                            kind = "tool_input_delta"
+                            content = TextField(delta, "partial_json")
+                        End If
+                    Case 1
+                        Dim contentBlock As JSONItem = streamed.Value("content_block")
+                        If TokenEquals(TextField(contentBlock, "type"), "tool_use") Then
+                            kind = "tool_call"
+                            toolCallId = TextField(contentBlock, "id")
+                            content = TextField(contentBlock, "name")
+                        End If
+                End Select
+            Case 2
+                kind = "assistant_message"
+                content = ContentText(message.Value("message").Value("content"))
+            Case 3
+                kind = "user_message"
+                content = ContentText(message.Value("message").Value("content"))
+            Case 4
+                kind = "turn_status"
+                If TokenEquals(TextField(message, "subtype"), "success") Then kind = "turn_complete"
+                If message.Value("is_error").AsBoolean().Or(False) Or String.StartsWith(TextField(message, "subtype"), "error_", True) Then kind = "turn_failed"
+                content = TextField(message, "result")
+            Case 5
+                kind = "request"
+                requestId = message.Value("request_id")
+                Dim control As JSONItem = message.Value("request")
+                If TokenEquals(TextField(control, "subtype"), "can_use_tool") Then
+                    kind = "approval"
+                    toolCallId = TextField(control, "tool_use_id")
+                    content = TextField(control, "tool_name")
+                End If
+        End Select
+    ElseIf protocol = AgentProtocol.Codex Then
+        sessionId = TextField(arguments, "threadId")
+        turnId = TextField(arguments, "turnId")
+        toolCallId = TextField(arguments, "itemId")
+        Select Case TokenIndex(methodName, ["thread/started", "item/agentMessage/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval", "item/tool/requestUserInput", "item/tool/call", "item/started", "item/completed", "turn/started", "turn/completed", "error"])
+            Case 0
+                kind = "session_started"
+                sessionId = TextField(arguments.Value("thread"), "id")
+            Case 1
+                kind = "text_delta"
+                content = TextField(arguments, "delta")
+            Case 2, 3
+                kind = "thought_delta"
+                content = TextField(arguments, "delta")
+            Case 4, 5, 6, 7
+                kind = "approval"
+                content = TextField(arguments, "reason")
+            Case 8
+                kind = "tool_call"
+                toolCallId = TextField(arguments, "callId")
+                content = TextField(arguments, "tool")
+            Case 9, 10
+                Dim item As JSONItem = arguments.Value("item")
+                toolCallId = TextField(item, "id")
+                kind = "item_started"
+                If TokenEquals(methodName, "item/completed") Then kind = "item_completed"
+                If TokenEquals(TextField(item, "type"), "agentMessage") And TokenEquals(methodName, "item/completed") Then
+                    kind = "assistant_message"
+                    content = TextField(item, "text")
+                End If
+            Case 11
+                kind = "turn_started"
+                turnId = TextField(arguments.Value("turn"), "id")
+            Case 12
+                kind = "turn_status"
+                Dim turn As JSONItem = arguments.Value("turn")
+                turnId = TextField(turn, "id")
+                If TokenEquals(TextField(turn, "status"), "completed") Then kind = "turn_complete"
+                If TokenEquals(TextField(turn, "status"), "failed") Then kind = "turn_failed"
+                If TokenEquals(TextField(turn, "status"), "interrupted") Then kind = "turn_interrupted"
+            Case 13
+                kind = "error"
+                content = TextField(arguments.Value("error"), "message")
+        End Select
+    ElseIf protocol = AgentProtocol.ACP Then
+        sessionId = TextField(arguments, "sessionId")
+        If TokenEquals(methodName, "session/update") Then
+            Dim update As JSONItem = arguments.Value("update")
+            Select Case TokenIndex(TextField(update, "sessionUpdate"), ["agent_message_chunk", "agent_thought_chunk", "user_message_chunk", "tool_call", "tool_call_update", "plan"])
+                Case 0
+                    kind = "text_delta"
+                    content = ContentText(update.Value("content"))
+                Case 1
+                    kind = "thought_delta"
+                    content = ContentText(update.Value("content"))
+                Case 2
+                    kind = "user_message"
+                    content = ContentText(update.Value("content"))
+                Case 3
+                    kind = "tool_call"
+                    toolCallId = TextField(update, "toolCallId")
+                    content = TextField(update, "title")
+                Case 4
+                    kind = "tool_update"
+                    toolCallId = TextField(update, "toolCallId")
+                    content = TextField(update, "title")
+                Case 5
+                    kind = "plan"
+                Case Else
+                    kind = "session_status"
+            End Select
+        ElseIf TokenEquals(methodName, "session/request_permission") Then
+            kind = "approval"
+            toolCallId = TextField(arguments.Value("toolCall"), "toolCallId")
+            content = TextField(arguments.Value("toolCall"), "title")
+        ElseIf TokenEquals(methodName, "fs/read_text_file") Or TokenEquals(methodName, "fs/write_text_file") Then
+            kind = "tool_call"
+            content = methodName
+        End If
+    End If
+    If TokenEquals(kind, "unknown") Then
+        If message.HasKey("result") Then
+            kind = "response"
+            If protocol = AgentProtocol.ACP Then
+                Dim responsePayload As JSONItem = message.Value("result")
+                If responsePayload.Value("sessionId").IsString() Then
+                    kind = "session_started"
+                    sessionId = TextField(responsePayload, "sessionId")
+                ElseIf responsePayload.Value("stopReason").IsString() Then
+                    kind = "turn_complete"
+                    If TokenEquals(TextField(responsePayload, "stopReason"), "cancelled") Then kind = "turn_interrupted"
+                End If
+            End If
+        ElseIf message.HasKey("error") Then
+            kind = "error"
+            content = TextField(message.Value("error"), "message")
+        ElseIf methodName <> "" Then
+            kind = "notification"
+            If message.HasKey("id") Then kind = "request"
+        End If
+    End If
+    Return New AgentEvent(kind, content, sessionId, turnId, toolCallId, requestId, message)
+End Function
+
+''' SDK control requests for Claude stream-json; caller supplies a unique string id.
+Public Function ClaudeControlRequest(requestId As String, subtype As String, arguments As JSONItem) As JSONItem
+    RequireText(requestId, "control request id")
+    RequireText(subtype, "control subtype")
+    Dim control As JSONItem = JSONItem.NewObject()
+    If arguments <> Nil Then
+        RequireObject(arguments)
+        control = CloneJSON(arguments)
+    End If
+    control.Value("subtype") = subtype
+    Dim message As JSONItem = JSONItem.NewObject()
+    message.Value("type") = "control_request"
+    message.Value("request_id") = requestId
+    message.Value("request") = control
+    Return message
+End Function
+
+''' Allow only the reviewed input, or deny with a reason; no policy changes are inferred.
+Public Function ClaudePermission(requestId As String, allow As Boolean, reviewedInput As JSONItem, reason As String = "Denied by client") As JSONItem
+    RequireText(requestId, "control request id")
+    Dim payload As JSONItem = JSONItem.NewObject()
+    If allow Then
+        RequireObject(reviewedInput)
+        payload.Value("behavior") = "allow"
+        payload.Value("updatedInput") = CloneJSON(reviewedInput)
+    Else
+        payload.Value("behavior") = "deny"
+        payload.Value("message") = reason
+    End If
+    Dim responsePayload As JSONItem = JSONItem.NewObject()
+    responsePayload.Value("subtype") = "success"
+    responsePayload.Value("request_id") = requestId
+    responsePayload.Value("response") = payload
+    Dim message As JSONItem = JSONItem.NewObject()
+    message.Value("type") = "control_response"
+    message.Value("response") = responsePayload
+    Return message
+End Function
