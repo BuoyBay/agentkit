@@ -77,7 +77,7 @@ all blocks. Claude streamed tool-input deltas need correlation using the raw
 content-block index. An approval event never grants permission or executes a
 tool. Only an explicit completed/success status becomes `turn_complete`.
 
-## Limits and verification
+## Limits
 
 Decoder defaults: 8 MiB per JSON line, 64 MiB per input chunk, 256 messages per
 feed, and 128 JSON nesting levels. Wire discriminators and approval decisions are compared
@@ -90,8 +90,6 @@ line byte cap excludes LF but includes a possible CR. Configure smaller limits
 for less trusted endpoints. Envelope builders validate required IDs, methods
 and object parameters, but are not complete provider schema validators.
 Numeric RPC IDs are restricted to exactly represented integers within ±(2^53−1).
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
 
 References: [ACP v1](https://agentclientprotocol.com/protocol/v1/initialization),
 [Codex app-server](https://learn.chatgpt.com/docs/app-server),

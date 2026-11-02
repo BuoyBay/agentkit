@@ -1,6 +1,6 @@
 # JSONL protocols for agent and MCP integrations
 
-Protocol codecs and event adapters for an agent-aware Buoy editor. This package
+Protocol codecs and event adapters for an agent-aware editor. This package
 owns **no transport, agent process, authentication or execution policy**. Feed
 stdout bytes from `processkit`, and send encoded bytes to its stdin; route
 stderr separately. MCP HTTP transports need their own HTTP/SSE implementation.
@@ -21,7 +21,7 @@ consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Import agentkit
 
 Sub Main()
@@ -56,7 +56,6 @@ On your own machine, install Buoy and run:
 buoy ai init --both
 ```
 
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

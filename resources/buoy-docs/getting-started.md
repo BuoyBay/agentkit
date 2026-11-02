@@ -15,7 +15,7 @@ Copy `agentkit-0.1.0.buipkg` into the consumer project's `packages/` directory, 
 
 The complete program below serializes one object with its terminating LF and decodes it. It performs no network request and launches no agent.
 
-```buoy
+```basic
 Import agentkit
 
 Sub Main()

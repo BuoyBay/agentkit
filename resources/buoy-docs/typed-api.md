@@ -75,8 +75,6 @@ Deliberately compact normalization; RawJSON preserves provider-specific fields.
 | `RequestId` | `JSONItem` | Yes | No | — | — |
 | `RawJSON` | `JSONItem` | Yes | No | — | — |
 
-## AgentKit functions
-
 ### EncodeJSONLine
 
 `Public Function EncodeJSONLine(message As JSONItem, maxLineBytes As Integer = 8388608) As Bytes`

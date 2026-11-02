@@ -48,5 +48,4 @@ Wire discriminators and approval decisions are case-sensitive. Raw or escaped JS
 
 Follow the [getting-started guide](getting-started.md) for a compiled example or return to the [overview](index.md).
 
-
 [Full typed API: properties, parameters, defaults, and returns](typed-api.md)
