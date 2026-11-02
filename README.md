@@ -1,4 +1,4 @@
-# JSONL codecs for agent protocols, ACP/Codex/Claude events, MCP requests
+# JSONL codecs for agents and MCP
 
 Protocol codecs and event adapters for an agent-aware editor. This package
 owns **no transport, agent process, authentication or execution policy**. Feed
